@@ -1,0 +1,377 @@
+// 기본적인 패턴 체킹
+
+package burp;
+
+import java.awt.Component;
+import java.util.ArrayList;
+import java.util.List;
+import javax.swing.*;
+import javax.swing.table.AbstractTableModel;
+import java.awt.BorderLayout;
+import java.awt.FlowLayout;
+import java.awt.GridLayout;
+import java.awt.event.ActionEvent;
+import java.awt.event.ActionListener;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
+import java.io.FileReader;
+import java.io.FileWriter;
+import java.io.File;
+import java.util.Properties;
+
+public class BurpExtender implements IBurpExtender, ITab, IHttpListener {
+    
+    private IBurpExtenderCallbacks callbacks;
+    private IExtensionHelpers helpers;
+    private JPanel mainPanel;
+    private List<LogEntry> logEntries = new ArrayList<>();
+    private LogTableModel logTableModel;
+    private JTable logTable;
+    
+    // 패턴 관리를 위한 변수들
+    private List<String> patterns = new ArrayList<>();
+    private PatternTableModel patternTableModel;
+    private JTable patternTable;
+    private JTextField patternField;
+    private static final String CONFIG_FILE = "burp_pattern_finder.properties";
+    
+    @Override
+    public void registerExtenderCallbacks(IBurpExtenderCallbacks callbacks) {
+        // 기본 설정
+        this.callbacks = callbacks;
+        this.helpers = callbacks.getHelpers();
+        callbacks.setExtensionName("패턴 찾기 확장");
+        
+        // 저장된 패턴 불러오기
+        loadPatterns();
+        
+        // UI 생성
+        SwingUtilities.invokeLater(new Runnable() {
+            @Override
+            public void run() {
+                // 메인 패널
+                mainPanel = new JPanel(new BorderLayout());
+                
+                // 상단 패널 - 패턴 관리
+                JPanel topPanel = new JPanel(new BorderLayout());
+                
+                // 패턴 입력 영역
+                JPanel inputPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
+                inputPanel.add(new JLabel("검색 패턴:"));
+                patternField = new JTextField(20);
+                inputPanel.add(patternField);
+                
+                JButton addButton = new JButton("추가");
+                addButton.addActionListener(e -> addPattern());
+                inputPanel.add(addButton);
+                
+                topPanel.add(inputPanel, BorderLayout.NORTH);
+                
+                // 패턴 테이블
+                patternTableModel = new PatternTableModel(patterns);
+                patternTable = new JTable(patternTableModel);
+                JScrollPane patternScrollPane = new JScrollPane(patternTable);
+                patternScrollPane.setPreferredSize(new java.awt.Dimension(0, 150));
+                
+                // 패턴 테이블 컨텍스트 메뉴
+                JPopupMenu patternPopupMenu = new JPopupMenu();
+                JMenuItem deleteItem = new JMenuItem("삭제");
+                deleteItem.addActionListener(e -> deleteSelectedPattern());
+                JMenuItem editItem = new JMenuItem("수정");
+                editItem.addActionListener(e -> editSelectedPattern());
+                patternPopupMenu.add(editItem);
+                patternPopupMenu.add(deleteItem);
+                
+                patternTable.addMouseListener(new MouseAdapter() {
+                    @Override
+                    public void mouseReleased(MouseEvent e) {
+                        if (e.isPopupTrigger()) {
+                            int row = patternTable.rowAtPoint(e.getPoint());
+                            if (row >= 0 && row < patternTable.getRowCount()) {
+                                patternTable.setRowSelectionInterval(row, row);
+                                patternPopupMenu.show(e.getComponent(), e.getX(), e.getY());
+                            }
+                        }
+                    }
+                    
+                    @Override
+                    public void mousePressed(MouseEvent e) {
+                        if (e.isPopupTrigger()) {
+                            int row = patternTable.rowAtPoint(e.getPoint());
+                            if (row >= 0 && row < patternTable.getRowCount()) {
+                                patternTable.setRowSelectionInterval(row, row);
+                                patternPopupMenu.show(e.getComponent(), e.getX(), e.getY());
+                            }
+                        }
+                    }
+                });
+                
+                topPanel.add(patternScrollPane, BorderLayout.CENTER);
+                
+                // 로그 테이블
+                logTableModel = new LogTableModel(logEntries);
+                logTable = new JTable(logTableModel);
+                JScrollPane logScrollPane = new JScrollPane(logTable);
+                
+                // 버튼 패널
+                JPanel buttonPanel = new JPanel();
+                JButton clearButton = new JButton("로그 지우기");
+                clearButton.addActionListener(e -> {
+                    logEntries.clear();
+                    logTableModel.fireTableDataChanged();
+                });
+                buttonPanel.add(clearButton);
+                
+                JButton saveButton = new JButton("패턴 저장");
+                saveButton.addActionListener(e -> savePatterns());
+                buttonPanel.add(saveButton);
+                
+                // 패널 배치
+                mainPanel.add(topPanel, BorderLayout.NORTH);
+                mainPanel.add(logScrollPane, BorderLayout.CENTER);
+                mainPanel.add(buttonPanel, BorderLayout.SOUTH);
+                
+                // 탭 등록
+                callbacks.customizeUiComponent(mainPanel);
+                callbacks.addSuiteTab(BurpExtender.this);
+                
+                // 로그에 시작 메시지
+                callbacks.printOutput("패턴 찾기 확장이 시작되었습니다. 저장된 패턴 수: " + patterns.size());
+            }
+        });
+        
+        // HTTP 리스너 등록
+        callbacks.registerHttpListener(this);
+    }
+    
+    // 패턴 추가
+    private void addPattern() {
+        String pattern = patternField.getText().trim();
+        if (!pattern.isEmpty() && !patterns.contains(pattern)) {
+            patterns.add(pattern);
+            patternTableModel.fireTableDataChanged();
+            patternField.setText("");
+            savePatterns();
+            callbacks.printOutput("패턴 추가됨: " + pattern);
+        }
+    }
+    
+    // 선택된 패턴 삭제
+    private void deleteSelectedPattern() {
+        int selectedRow = patternTable.getSelectedRow();
+        if (selectedRow >= 0 && selectedRow < patterns.size()) {
+            String pattern = patterns.get(selectedRow);
+            patterns.remove(selectedRow);
+            patternTableModel.fireTableDataChanged();
+            savePatterns();
+            callbacks.printOutput("패턴 삭제됨: " + pattern);
+        }
+    }
+    
+    // 선택된 패턴 수정
+    private void editSelectedPattern() {
+        int selectedRow = patternTable.getSelectedRow();
+        if (selectedRow >= 0 && selectedRow < patterns.size()) {
+            String oldPattern = patterns.get(selectedRow);
+            String newPattern = JOptionPane.showInputDialog(mainPanel, "패턴 수정:", oldPattern);
+            
+            if (newPattern != null && !newPattern.trim().isEmpty() && !patterns.contains(newPattern)) {
+                patterns.set(selectedRow, newPattern);
+                patternTableModel.fireTableDataChanged();
+                savePatterns();
+                callbacks.printOutput("패턴 수정됨: " + oldPattern + " -> " + newPattern);
+            }
+        }
+    }
+    
+    // 패턴 저장
+    private void savePatterns() {
+        try {
+            Properties props = new Properties();
+            props.setProperty("patterns.count", String.valueOf(patterns.size()));
+            
+            for (int i = 0; i < patterns.size(); i++) {
+                props.setProperty("pattern." + i, patterns.get(i));
+            }
+            
+            File configDir = new File(System.getProperty("user.home"), ".burp");
+            if (!configDir.exists()) {
+                configDir.mkdir();
+            }
+            
+            File configFile = new File(configDir, CONFIG_FILE);
+            FileWriter writer = new FileWriter(configFile);
+            props.store(writer, "Burp Pattern Finder Configuration");
+            writer.close();
+            
+            callbacks.printOutput("패턴이 저장되었습니다: " + configFile.getAbsolutePath());
+        } catch (Exception e) {
+            callbacks.printError("패턴 저장 중 오류 발생: " + e.getMessage());
+        }
+    }
+    
+    // 패턴 불러오기
+    private void loadPatterns() {
+        try {
+            File configDir = new File(System.getProperty("user.home"), ".burp");
+            File configFile = new File(configDir, CONFIG_FILE);
+            
+            if (configFile.exists()) {
+                Properties props = new Properties();
+                FileReader reader = new FileReader(configFile);
+                props.load(reader);
+                reader.close();
+                
+                int count = Integer.parseInt(props.getProperty("patterns.count", "0"));
+                
+                patterns.clear();
+                for (int i = 0; i < count; i++) {
+                    String pattern = props.getProperty("pattern." + i);
+                    if (pattern != null && !pattern.isEmpty()) {
+                        patterns.add(pattern);
+                    }
+                }
+                
+                callbacks.printOutput("패턴을 불러왔습니다: " + configFile.getAbsolutePath());
+            }
+        } catch (Exception e) {
+            callbacks.printError("패턴 불러오기 중 오류 발생: " + e.getMessage());
+        }
+    }
+    
+    @Override
+    public String getTabCaption() {
+        return "패턴 찾기";
+    }
+    
+    @Override
+    public Component getUiComponent() {
+        return mainPanel;
+    }
+    
+    @Override
+    public void processHttpMessage(int toolFlag, boolean messageIsRequest, IHttpRequestResponse messageInfo) {
+        // 응답만 처리
+        if (messageIsRequest) {
+            return;
+        }
+        
+        try {
+            // 응답 분석
+            byte[] response = messageInfo.getResponse();
+            String responseStr = new String(response);
+            
+            // URL 가져오기
+            IRequestInfo requestInfo = helpers.analyzeRequest(messageInfo);
+            String url = requestInfo.getUrl().toString();
+            
+            // 패턴 찾기
+            for (String pattern : patterns) {
+                if (responseStr.contains(pattern) || url.contains(pattern)) {
+                    // 로그에 추가
+                    logEntries.add(new LogEntry(
+                        url,
+                        helpers.analyzeResponse(response).getStatusCode(),
+                        "패턴 발견: " + pattern
+                    ));
+                    
+                    // 테이블 업데이트
+                    SwingUtilities.invokeLater(new Runnable() {
+                        @Override
+                        public void run() {
+                            logTableModel.fireTableDataChanged();
+                        }
+                    });
+                    
+                    // 콘솔에 출력
+                    callbacks.printOutput("패턴 발견: " + pattern + " in " + url);
+                    
+                    // 하나의 패턴을 찾았다면 다른 패턴은 확인하지 않음
+                    break;
+                }
+            }
+        } 
+        catch (Exception e) {
+            callbacks.printError("오류 발생: " + e.getMessage());
+        }
+    }
+    
+    // 로그 항목 클래스
+    private static class LogEntry {
+        final String url;
+        final int statusCode;
+        final String details;
+        
+        LogEntry(String url, int statusCode, String details) {
+            this.url = url;
+            this.statusCode = statusCode;
+            this.details = details;
+        }
+    }
+    
+    // 로그 테이블 모델
+    private static class LogTableModel extends AbstractTableModel {
+        private List<LogEntry> log;
+        private String[] columnNames = {"URL", "상태 코드", "세부 정보"};
+        
+        LogTableModel(List<LogEntry> log) {
+            this.log = log;
+        }
+        
+        @Override
+        public int getRowCount() {
+            return log.size();
+        }
+        
+        @Override
+        public int getColumnCount() {
+            return columnNames.length;
+        }
+        
+        @Override
+        public String getColumnName(int column) {
+            return columnNames[column];
+        }
+        
+        @Override
+        public Object getValueAt(int row, int col) {
+            LogEntry entry = log.get(row);
+            switch (col) {
+                case 0: return entry.url;
+                case 1: return entry.statusCode;
+                case 2: return entry.details;
+                default: return "";
+            }
+        }
+    }
+    
+    // 패턴 테이블 모델
+    private static class PatternTableModel extends AbstractTableModel {
+        private List<String> patterns;
+        private String[] columnNames = {"검색 패턴"};
+        
+        PatternTableModel(List<String> patterns) {
+            this.patterns = patterns;
+        }
+        
+        @Override
+        public int getRowCount() {
+            return patterns.size();
+        }
+        
+        @Override
+        public int getColumnCount() {
+            return columnNames.length;
+        }
+        
+        @Override
+        public String getColumnName(int column) {
+            return columnNames[column];
+        }
+        
+        @Override
+        public Object getValueAt(int row, int col) {
+            return patterns.get(row);
+        }
+    }
+}
